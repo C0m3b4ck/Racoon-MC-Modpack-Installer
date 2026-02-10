@@ -1,4 +1,5 @@
 # Raccoon-MC-Modpack-Installer ![GitHub All Releases](https://img.shields.io/github/downloads/C0m3b4ck/Racoon-MC-Modpack-Installer/total)
+<br><b>🇪🇺🇪🇺🇪🇺Made in Europe🇪🇺🇪🇺🇪🇺
 
 Racoon MC Modpack Installer is a very light script that installs a Minecraft modpack either via a direct link (ending with .zip) or from a .html file (that you get in the modpack folder).
 <br> It requires just TWO libraries + a version of Python 3 (untested on Python 2).
