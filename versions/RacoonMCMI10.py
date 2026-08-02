@@ -1,11 +1,57 @@
 import os
 import json
+import re
 import zipfile
 import shutil
 import urllib.request
+from urllib.parse import urlparse, unquote
 import requests
 from bs4 import BeautifulSoup
 from pathlib import Path
+
+DOWNLOAD_TIMEOUT = 30
+MAX_DOWNLOAD_BYTES = 4 * 1024 * 1024 * 1024
+
+def sanitize_pack_name(pack_name):
+    """Return pack_name reduced to a safe single path component."""
+    name = str(pack_name).strip()
+    name = re.sub(r'[/\\]', '_', name)
+    name = re.sub(r'[<>:"|?*\x00-\x1f]', '', name)
+    name = name.strip('. ')
+    return name or "FTB_Pack"
+
+def is_safe_zip_member(filename):
+    """Return True if a zip member name cannot escape the extraction directory."""
+    name = filename.replace('\\', '/')
+    if name.startswith('/') or (len(name) >= 2 and name[1] == ':'):
+        return False
+    return '..' not in name.split('/')
+
+def download_with_limit(url, dest_path, timeout=DOWNLOAD_TIMEOUT, max_bytes=MAX_DOWNLOAD_BYTES):
+    """Download url to dest_path with a timeout and a sanity size limit."""
+    with urllib.request.urlopen(url, timeout=timeout) as response:
+        with open(dest_path, 'wb') as out:
+            total = 0
+            while True:
+                chunk = response.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ValueError(f"Download exceeds sanity size limit of {max_bytes} bytes")
+                out.write(chunk)
+
+def valid_profile_version(version):
+    """Return True if version looks like a version string (non-empty, no path separators)."""
+    v = str(version).strip()
+    return bool(v) and '/' not in v and '\\' not in v
+
+def prompt_profile_version():
+    while True:
+        profile_version = str(input("Input Minecraft version for modpack: ")).strip()
+        if valid_profile_version(profile_version):
+            return profile_version
+        print("Invalid version. Please enter a non-empty version without path separators.")
 
 def download_and_install_ftb_pack_from_link(pack_url, minecraft_dir=".", pack_name="FTB_Pack"):
     """
@@ -22,6 +68,8 @@ def download_and_install_ftb_pack_from_link(pack_url, minecraft_dir=".", pack_na
         print("Invalid direct download link. Please provide a URL ending with .zip.")
         return
 
+    pack_name = sanitize_pack_name(pack_name)
+
     minecraft_path = Path(minecraft_dir).expanduser().resolve()
     instances_dir = minecraft_path / "instances"
     profiles_path = minecraft_path / "launcher_profiles.json"
@@ -35,15 +83,20 @@ def download_and_install_ftb_pack_from_link(pack_url, minecraft_dir=".", pack_na
     print(f"Downloading FTB pack from {pack_url}...")
     zip_file_path = pack_instance_dir / "pack.zip"
     try:
-        urllib.request.urlretrieve(pack_url, zip_file_path)
+        download_with_limit(pack_url, zip_file_path)
     except Exception as e:
         print(f"Error downloading pack: {e}")
+        if zip_file_path.exists():
+            zip_file_path.unlink()
         return
 
     # 2. Extract the FTB pack
     print("Extracting FTB pack...")
     try:
         with zipfile.ZipFile(zip_file_path, 'r') as zip_ref:
+            for member in zip_ref.infolist():
+                if not is_safe_zip_member(member.filename):
+                    raise ValueError(f"Unsafe zip member name rejected: {member.filename!r}")
             zip_ref.extractall(pack_instance_dir)
     except Exception as e:
         print(f"Error extracting pack: {e}")
@@ -79,6 +132,13 @@ def download_and_install_ftb_pack_from_link(pack_url, minecraft_dir=".", pack_na
         for item in libraries_source_dir.iterdir():
             shutil.move(str(item), str(libraries_target_dir))
 
+    # Modern FTB/CurseForge packs keep the playable content under "overrides/"
+    overrides_source_dir = pack_instance_dir / "overrides"
+    overrides_target_dir = pack_instance_dir / "minecraft"
+    if overrides_source_dir.exists():
+        print("Applying overrides...")
+        shutil.copytree(overrides_source_dir, overrides_target_dir, dirs_exist_ok=True)
+
     # 4. Create or update the launcher_profiles.json file
     print("Updating launcher profile...")
     try:
@@ -93,7 +153,7 @@ def download_and_install_ftb_pack_from_link(pack_url, minecraft_dir=".", pack_na
 
     # Unique ID for the new profile
     profile_id = f"{pack_name}"
-    profile_version = str(input("Input Minecraft version for modpack: "))
+    profile_version = prompt_profile_version()
 
     profiles_data["profiles"][profile_id] = {
         "name": pack_name,
@@ -125,6 +185,8 @@ def download_and_install_ftb_pack_from_html(html_file_path, minecraft_dir=".", p
         minecraft_dir (str, optional):  Path to the Minecraft directory. Defaults to ".".
         pack_name (str, optional): Name of the modpack.  Will be used for the profile name. Defaults to "FTB_Pack".
     """
+
+    pack_name = sanitize_pack_name(pack_name)
 
     # Parse the local HTML file
     try:
@@ -159,9 +221,12 @@ def download_and_install_ftb_pack_from_html(html_file_path, minecraft_dir=".", p
             # If it's a URL, download the file
             try:
                 print(f"Downloading mod from {link}...")
-                response = requests.get(link, stream=True)
+                response = requests.get(link, stream=True, timeout=DOWNLOAD_TIMEOUT)
                 if response.status_code == 200:
-                    file_name = Path(link).name
+                    file_name = unquote(Path(urlparse(link).path).name)
+                    if not file_name or file_name in ('.', '..'):
+                        print(f"Could not determine a valid file name from {link}.")
+                        continue
                     file_path = mods_dir / file_name
                     with open(file_path, 'wb') as f:
                         for chunk in response.iter_content(chunk_size=1024):
@@ -190,7 +255,7 @@ def download_and_install_ftb_pack_from_html(html_file_path, minecraft_dir=".", p
 
     # Unique ID for the new profile
     profile_id = f"{pack_name}"
-    profile_version = str(input("Input Minecraft version for modpack: "))
+    profile_version = prompt_profile_version()
 
     profiles_data["profiles"][profile_id] = {
         "name": pack_name,
